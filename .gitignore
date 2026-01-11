@@ -1,0 +1,124 @@
+# =========================
+# Node / npm
+# =========================
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# npm cache (should NEVER be in repo)
+.npm/
+.npm-cache/
+
+# =========================
+# Environment files
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Build outputs
+# =========================
+dist/
+dist-electron/
+build/
+out/
+release/
+releases/
+app-builds/
+coverage/
+
+# Electron specific
+*.asar
+*.asar.unpacked/
+
+# =========================
+# Vite / Bundlers
+# =========================
+.vite/
+.esbuild/
+.parcel-cache/
+.cache-loader/
+
+# =========================
+# TypeScript
+# =========================
+*.tsbuildinfo
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Temp / Cache
+# =========================
+.cache/
+.tmp/
+.temp/
+tmp/
+temp/
+
+# =========================
+# OS junk
+# =========================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+
+# =========================
+# Testing
+# =========================
+__tests__/__snapshots__/
+.nyc_output/
+
+# =========================
+# Secrets / Keys (safety net)
+# =========================
+*.pem
+*.key
+*.crt
+
+# =========================
+# Local databases
+# =========================
+*.sqlite
+*.sqlite3
+
+# =========================
+# Custom
+# =========================
+obs_screen_recordings
+error
+samples
