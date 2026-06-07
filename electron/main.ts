@@ -3,43 +3,77 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { exec } from 'child_process'
 
-// --- Clipboard Manager ---
-let clipboardHistory: { id: string, text: string, time: number }[] = [];
+// --- Clipboard Manager (Optimized for EIO Errors) ---
+let clipboardHistory: { id: string, text?: string, image?: string, fullImage?: string, time: number, type: 'text' | 'image' | 'video' }[] = [];
 let lastClipboardText = '';
+let lastClipboardImageHash = '';
 
 function startClipboardMonitor() {
   setInterval(() => {
-    const text = clipboard.readText();
-    if (text && text !== lastClipboardText) {
-      lastClipboardText = text;
-      const item = {
-        id: Date.now().toString(),
-        text,
-        time: Date.now()
-      };
-      
-      // Add to beginning, remove duplicates if identical text exists
-      clipboardHistory = [item, ...clipboardHistory.filter(i => i.text !== text)].slice(0, 40);
-      
-      // Optional: Notify renderer if window is open
-      win?.webContents.send('clipboard-updated', clipboardHistory);
-    }
-  }, 1000);
+    if (!win || win.isDestroyed() || !win.webContents || win.webContents.isDestroyed()) return;
+
+    // 1. Text/Video Monitor
+    try {
+        const text = clipboard.readText();
+        if (text && text !== lastClipboardText) {
+            lastClipboardText = text;
+            const isVideo = /\.(mp4|mov|webm|mkv|avi)$/i.test(text.trim());
+            const item: any = { id: Date.now().toString(), text, time: Date.now(), type: isVideo ? 'video' : 'text' };
+            clipboardHistory = [item, ...clipboardHistory.filter(i => i.text !== text)].slice(0, 20);
+            if (!win.webContents.isDestroyed()) {
+              win.webContents.send('clipboard-updated', clipboardHistory.map(i => ({...i, fullImage: undefined})));
+            }
+        }
+    } catch (e) {}
+
+    // 2. Image Monitor (Resize thumbnails to prevent IPC bloat)
+    try {
+        const image = clipboard.readImage();
+        if (!image.isEmpty()) {
+            const dataUrl = image.toDataURL();
+            const hash = dataUrl.slice(-100); 
+            if (hash !== lastClipboardImageHash) {
+                lastClipboardImageHash = hash;
+                // Create a small thumbnail for the list to keep IPC fast and prevent EIO
+                const thumbnail = image.resize({ width: 200 }).toDataURL();
+                const item: any = { 
+                    id: Date.now().toString(), 
+                    image: thumbnail, 
+                    fullImage: dataUrl, // Keep full res for preview on demand
+                    time: Date.now(), 
+                    type: 'image' 
+                };
+                clipboardHistory = [item, ...clipboardHistory].slice(0, 20);
+                // Send only the thumbnails to the renderer
+                if (!win.webContents.isDestroyed()) {
+                  win.webContents.send('clipboard-updated', clipboardHistory.map(i => ({...i, fullImage: undefined})));
+                }
+            }
+        }
+    } catch (e) {}
+  }, 1500); // Increased interval slightly
 }
 
-// --- Settings Persistence Helpers ---
+// --- Settings ---
 const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json');
 const DEFAULT_SETTINGS = {
   globalShortcut: 'CommandOrControl+Shift+G',
+  featureShortcuts: { 
+    capture: 'CommandOrControl+Shift+1', 
+    clipboard: 'CommandOrControl+Shift+2', 
+    notes: 'CommandOrControl+Shift+3', 
+    focus: 'CommandOrControl+Shift+4',
+    breathing: 'CommandOrControl+Shift+5'
+  },
   quickNoteSaveLocation: app.getPath('desktop')
 };
 
 function loadSettings() {
-  try {
+  try { 
     if (fs.existsSync(SETTINGS_PATH)) {
-      const data = fs.readFileSync(SETTINGS_PATH, 'utf-8');
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(data) };
-    }
+      const saved = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8'));
+      return { ...DEFAULT_SETTINGS, ...saved, featureShortcuts: { ...DEFAULT_SETTINGS.featureShortcuts, ...saved.featureShortcuts } };
+    } 
   } catch (e) {
     console.error('Failed to load settings', e);
   }
@@ -47,485 +81,322 @@ function loadSettings() {
 }
 
 function saveSettings(settings: any) {
-  try {
-    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  try { 
+    const current = loadSettings();
+    const updated = { ...current, ...settings };
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(updated, null, 2)); 
+    return updated;
   } catch (e) {
     console.error('Failed to save settings', e);
+    return loadSettings();
   }
 }
 
-// --- Global Variables ---
 let win: BrowserWindow | null = null;
-let quickNoteWin: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+
+function updateTrayMenu() {
+    if (!tray) return;
+    const settings = loadSettings();
+    const mainShortcut = settings.globalShortcut || 'CommandOrControl+Shift+G';
+    const featureShortcuts = settings.featureShortcuts || {};
+    
+    const getAccelerator = (combo: string | undefined) => {
+        if (!combo || combo === 'None') return undefined;
+        return combo;
+    };
+
+    const contextMenu = Menu.buildFromTemplate([
+        { label: 'Show Salad Launcher', accelerator: getAccelerator(mainShortcut), click: toggleWindow },
+        { type: 'separator' },
+        { label: '📸 Capture (Img/Vid)', accelerator: getAccelerator(featureShortcuts.capture), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'capture'); } },
+        { label: '📋 Clipboard History', accelerator: getAccelerator(featureShortcuts.clipboard), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'clipboard'); } },
+        { label: '📝 Quick Notes', accelerator: getAccelerator(featureShortcuts.notes), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'notes'); } },
+        { label: '⏱️ Focus Timer', accelerator: getAccelerator(featureShortcuts.focus), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'focus'); } },
+        { label: '🧠 Mind Map', accelerator: getAccelerator(featureShortcuts.mindmap), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'mindmap'); } },
+        { label: '🌬️ Breathing Tool', accelerator: getAccelerator(featureShortcuts.breathing), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'breathing'); } },
+        { type: 'separator' },
+        { label: '⚙️ Settings', click: () => { toggleWindow(); win?.webContents.send('open-settings'); } },
+        { type: 'separator' },
+        { label: 'Quit Salad', click: () => { isQuitting = true; app.quit(); } }
+    ]);
+    tray.setContextMenu(contextMenu);
+}
+
+function refreshShortcuts() {
+    globalShortcut.unregisterAll();
+    const settings = loadSettings();
+    const failures: string[] = [];
+    
+    // Register Main Toggle
+    if (settings.globalShortcut) {
+        try {
+            const success = globalShortcut.register(settings.globalShortcut, toggleWindow);
+            if (!success) failures.push(settings.globalShortcut);
+        } catch (e) {
+            console.error(`Failed to register global shortcut: ${settings.globalShortcut}`, e);
+            failures.push(settings.globalShortcut);
+        }
+    }
+
+    // Register Feature Shortcuts
+    if (settings.featureShortcuts) {
+        Object.entries(settings.featureShortcuts).forEach(([feat, combo]) => {
+            if (!combo || combo === 'None') return;
+            try {
+                const success = globalShortcut.register(combo as string, () => {
+                    if (!win) return;
+                    win.setSize(800, 600);
+                    win.center();
+                    win.show();
+                    win.focus();
+                    win.webContents.send('switch-tab', feat);
+                });
+                if (!success) failures.push(combo as string);
+            } catch (e) {
+                console.error(`Failed to register feature shortcut for ${feat}: ${combo}`, e);
+                failures.push(combo as string);
+            }
+        });
+    }
+
+    if (failures.length > 0) {
+        win?.webContents.send('shortcut-registration-failed', failures);
+    }
+    
+    updateTrayMenu();
+}
 
 process.env.DIST = path.join(__dirname, '../dist')
 process.env.VITE_PUBLIC = app.isPackaged ? process.env.DIST : path.join(__dirname, '../public')
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
-
-// --- Window Management ---
 function createWindow() {
-  const { width, height } = screen.getPrimaryDisplay().workAreaSize
-  const iconPath = path.join(process.env.VITE_PUBLIC || '', 'icon.png');
-
   win = new BrowserWindow({
-    width: 800,
-    height: 600,
-    icon: iconPath,
-    title: 'Salad',
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    resizable: true,
-    show: false,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      nodeIntegration: true,
-      contextIsolation: false,
-    },
+    width: 800, height: 600, icon: path.join(process.env.VITE_PUBLIC || '', 'icon.png'),
+    title: 'Salad', frame: false, transparent: true, alwaysOnTop: true, resizable: true, show: false,
+    backgroundColor: '#00000000',
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), nodeIntegration: true, contextIsolation: false },
   })
-
-  win.center()
-
-  win.webContents.on('did-finish-load', () => {
-    win?.webContents.send('main-process-message', (new Date).toLocaleString())
-    // Send current settings to renderer on load
-    const settings = loadSettings();
-    win?.webContents.send('settings-loaded', settings);
-  })
-
-  if (VITE_DEV_SERVER_URL) {
-    win.loadURL(VITE_DEV_SERVER_URL)
-  } else {
-    win.loadFile(path.join(process.env.DIST || '', 'index.html'))
-  }
-
-  win.on('close', (event) => {
-    if (!isQuitting) {
-      event.preventDefault()
-      win?.hide()
-    }
-    return false
-  })
-}
-
-function createQuickNoteWindow() {
-  if (quickNoteWin && !quickNoteWin.isDestroyed()) {
-    quickNoteWin.show();
-    quickNoteWin.focus();
-    return;
-  }
-
-  const iconPath = path.join(process.env.VITE_PUBLIC || '', 'icon.png');
-
-  quickNoteWin = new BrowserWindow({
-    width: 300,
-    height: 400,
-    icon: iconPath,
-    title: 'Quick Note',
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    resizable: true,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      nodeIntegration: true,
-      contextIsolation: false,
-    },
-  });
-
-  if (VITE_DEV_SERVER_URL) {
-    quickNoteWin.loadURL(`${VITE_DEV_SERVER_URL}#/quicknote`);
-  } else {
-    quickNoteWin.loadFile(path.join(process.env.DIST || '', 'index.html'), { hash: 'quicknote' });
-  }
+  win.center();
+  win.webContents.on('did-finish-load', () => win?.webContents.send('settings-loaded', loadSettings()));
+  if (VITE_DEV_SERVER_URL) win.loadURL(VITE_DEV_SERVER_URL); else win.loadFile(path.join(process.env.DIST || '', 'index.html'));
+  win.on('close', (e) => { if (!isQuitting) { e.preventDefault(); win?.hide(); } return false; });
 }
 
 function toggleWindow() {
-  if (win) {
+  if (win) { 
     if (win.isVisible()) {
-      win.hide()
-    } else {
-      win.setSize(800, 600)
-      win.center()
-      win.show()
-      win.focus()
-    }
+      win.hide(); 
+    } else { 
+      const d = screen.getPrimaryDisplay().workAreaSize;
+      const width = 600;
+      const height = 80;
+      win.setSize(width, height);
+      win.setPosition(
+        Math.floor((d.width - width) / 2),
+        Math.floor(d.height * 0.75 - (height / 2))
+      );
+      win.show(); 
+      win.focus(); 
+    } 
   }
 }
 
-function registerGlobalShortcut(shortcutKey: string) {
-  globalShortcut.unregisterAll(); // Clear existing
-  try {
-    const ret = globalShortcut.register(shortcutKey, toggleWindow);
-    if (!ret) {
-      console.log('Registration failed for:', shortcutKey);
-      return false;
-    }
-    console.log('Registered shortcut:', shortcutKey);
-    return true;
-  } catch (err) {
-    console.error('Error registering shortcut:', err);
-    return false;
-  }
-}
-
-// --- App Lifecycle ---
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
-})
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow()
-  }
-})
-
-// Set App Name explicitly for macOS
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() });
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() });
 app.setName('Salad');
 
-// Hide dock icon on macOS to behave like a background utility
-if (process.platform === 'darwin') {
-  app.dock?.hide();
+// Hide from Dock / Cmd+Tab on macOS for a "Pro Utility" feel
+if (process.platform === 'darwin' && app.dock) {
+  app.dock.hide();
 }
 
 app.whenReady().then(() => {
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.hammaadworks.salad');
+  }
+
   createWindow()
   startClipboardMonitor()
 
-  // Auto-hide on blur (clicking outside)
-  win?.on('blur', () => {
-    // Check if we are in a "modal" or "fullscreen" state where we might not want to hide?
-    // For now, let's assume if it's visible and not in some special state, we hide.
-    // However, we need to be careful if the user is interacting with something that steals focus temporarily.
-    // But for a Spotlight-like app, standard behavior is to hide.
-    // We can check if the window is fullscreen (screenshot mode) - in that case, we might NOT want to hide immediately
-    // or maybe we do? If they click a different monitor?
-    // Let's rely on a variable or window state.
-    const isFullscreen = win?.isFullScreen(); // or check bounds
-    // Better: check our own state if we track it, but for now:
-    // If the window is massive (covering screen), likely in screenshot mode.
-    const { width } = win?.getBounds() || { width: 0 };
-    const screenWidth = screen.getPrimaryDisplay().workAreaSize.width;
-    
-    // Simple heuristic: If width is roughly screen width, we are in fullscreen tool mode.
-    // We might NOT want to auto-hide in tool mode if they accidentally click a notification or something?
-    // Actually, usually tools capture the whole screen so you can't click "outside".
-    // But if multi-monitor... 
-    // Let's just hide for now, unless we find it annoying.
-    // Safest: Hide if NOT fullscreen.
-    if (width < screenWidth) {
-       win?.hide();
-    }
+  // Standard Quit Shortcut
+  globalShortcut.register('CommandOrControl+Q', () => {
+    isQuitting = true;
+    app.quit();
   });
 
-  // 1. Load Settings & Register Shortcut
-  const settings = loadSettings();
-  registerGlobalShortcut(settings.globalShortcut);
+  win?.on('blur', () => {
+    const { width } = win?.getBounds() || { width: 0 };
+    if (width < screen.getPrimaryDisplay().workAreaSize.width) win?.hide();
+  });
 
-  // 2. Create Tray Icon
-  // Use a dedicated monochrome icon for the tray (better for macOS)
+  refreshShortcuts();
+
+  ipcMain.on('register-feature-shortcuts', () => { refreshShortcuts(); });
+
+  // Tray implementation with robust path resolution
   const trayIconPath = path.join(process.env.VITE_PUBLIC || '', 'tray.png');
+  let trayIcon = nativeImage.createFromPath(trayIconPath);
   
-  let icon = nativeImage.createFromPath(trayIconPath);
-    // For macOS tray, icons should be small and template-friendly
-    if (process.platform === 'darwin') {
-       icon = icon.resize({ width: 22, height: 22 }); // 22x22 is standard for macOS menu bar
-       icon.setTemplateImage(true); // This makes it adapt to light/dark mode (monochrome)
+  if (trayIcon.isEmpty()) {
+    // Fallback to a simple circle if icon is missing
+    trayIcon = nativeImage.createFromNamedImage('NSStatusAvailable', [0, 0, 0]);
   }
 
-  tray = new Tray(icon);
-  const contextMenu = Menu.buildFromTemplate([
-    { label: 'Show Salad', click: toggleWindow },
-    { label: 'Quick Note', click: createQuickNoteWindow },
-    { type: 'separator' },
-    { label: 'Quit', click: () => {
-        isQuitting = true;
-        app.quit();
-      } 
-    }
-  ]);
-  tray.setToolTip('Salad');
-  tray.setContextMenu(contextMenu);
-  
-  // Also open on tray click
+  if (process.platform === 'darwin') {
+    trayIcon = trayIcon.resize({ width: 20, height: 20 });
+    trayIcon.setTemplateImage(true);
+  } else {
+    trayIcon = trayIcon.resize({ width: 16, height: 16 });
+  }
+
+  tray = new Tray(trayIcon);
+  tray.setToolTip('Salad - Productivity OS');
   tray.on('click', toggleWindow);
-
-  // 3. Setup IPC for Settings
-  ipcMain.on('update-shortcut', (event, newShortcut) => {
-    console.log('Updating shortcut to:', newShortcut);
-    const success = registerGlobalShortcut(newShortcut);
-    if (success) {
-      const currentSettings = loadSettings();
-      currentSettings.globalShortcut = newShortcut;
-      saveSettings(currentSettings);
-      event.reply('shortcut-updated', { success: true, shortcut: newShortcut });
-    } else {
-      event.reply('shortcut-updated', { success: false });
-    }
-  });
-
-  ipcMain.on('save-settings', (event, newSettings) => {
-    const currentSettings = loadSettings();
-    const updated = { ...currentSettings, ...newSettings };
-    saveSettings(updated);
-    // Optionally notify windows?
-  });
-
-  // --- Bounding Box Persistence ---
-  ipcMain.on('get-bounding-boxes', (event) => {
-    const settings = loadSettings();
-    event.reply('bounding-boxes-loaded', settings.boundingBoxes || []);
-  });
-
-  ipcMain.on('save-bounding-boxes', (event, boxes) => {
-    const currentSettings = loadSettings();
-    currentSettings.boundingBoxes = boxes;
-    saveSettings(currentSettings);
-  });
-
-  // --- Clipboard IPC ---
-  ipcMain.on('get-clipboard-history', (event) => {
-    event.reply('clipboard-history', clipboardHistory);
-  });
-
-  ipcMain.on('paste-clipboard-item', (event, text) => {
-    clipboard.writeText(text);
-    
-    // On macOS, hiding the app is more effective for returning focus than hiding the window
-    if (process.platform === 'darwin') {
-      app.hide();
-    } else if (win) {
-      win.hide();
-    }
-    
-    // Increased timeout to ensure focus returns to target app before pasting
-    setTimeout(() => {
-      // Simulate Paste (Cmd+V or Ctrl+V)
-      if (process.platform === 'darwin') {
-        exec('osascript -e "tell application \\"System Events\\" to keystroke \\"v\\" using command down"');
-      } else if (process.platform === 'win32') {
-        exec('powershell -WindowStyle Hidden -Command "$wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys(\'^v\')"');
-      } else if (process.platform === 'linux') {
-        exec('xdotool key ctrl+v', (error) => {
-          if (error) {
-            console.warn('xdotool paste failed. Ensure xdotool is installed.', error);
-            // Fallback for some Wayland setups (experimental)
-            exec('wtype -M ctrl -k v -m ctrl').unref(); 
-          }
-        });
-      }
-    }, 300);
-  });
+  updateTrayMenu();
 
 
-  ipcMain.on('save-image', (event, { dataUrl }) => {
-    try {
-      const img = nativeImage.createFromDataURL(dataUrl);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `Salad-Screenshot-${timestamp}.png`;
-      const savePath = path.join(app.getPath('downloads'), filename);
-      
-      fs.writeFile(savePath, img.toPNG(), (err) => {
-        if (err) {
-          console.error('Failed to save image:', err);
-          event.reply('image-saved', { success: false, error: err.message });
-        } else {
-          console.log('Image saved to:', savePath);
-          // Optional: Show notification
-          event.reply('image-saved', { success: true, path: savePath });
-          // Reveal in finder/explorer
-          // shell.showItemInFolder(savePath); // 'shell' needs import
-        }
-      });
-    } catch (e: any) {
-      console.error('Error saving image:', e);
-      event.reply('image-saved', { success: false, error: e.message });
-    }
-  });
-
-  ipcMain.on('copy-image', (event, { dataUrl }) => {
-    try {
-      const img = nativeImage.createFromDataURL(dataUrl);
-      clipboard.writeImage(img);
-      event.reply('image-copied', { success: true });
-    } catch (e: any) {
-      console.error('Error copying image:', e);
-      event.reply('image-copied', { success: false, error: e.message });
-    }
-  });
-
-  ipcMain.on('save-quick-note', (event, content) => {
-    const settings = loadSettings();
-    const savePath = settings.quickNoteSaveLocation || app.getPath('desktop');
-    // Ensure directory exists if possible, but user might have deleted it. 
-    // We assume the path is valid.
-    
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `QuickNote-${timestamp}.md`;
-    const fullPath = path.join(savePath, filename);
-
-    fs.writeFile(fullPath, content, (err) => {
-      if (err) {
-        console.error('Failed to save quick note:', err);
-        event.reply('quick-note-saved', { success: false, error: err.message });
-      } else {
-        console.log('Quick note saved to:', fullPath);
-        event.reply('quick-note-saved', { success: true, path: fullPath });
-        if (quickNoteWin && !quickNoteWin.isDestroyed()) {
-          quickNoteWin.close();
-        }
-      }
-    });
-  });
-
-  ipcMain.on('get-settings', (event) => {
-    event.reply('settings-loaded', loadSettings());
-  });
-
-  ipcMain.handle('select-folder', async () => {
-    const result = await dialog.showOpenDialog(win!, {
-      properties: ['openDirectory']
-    });
-    if (!result.canceled && result.filePaths.length > 0) {
-      return result.filePaths[0];
-    }
-    return null;
-  });
-
-
-
-  // --- Mouse Events IPC ---
-  ipcMain.on('set-ignore-mouse-events', (event, ignore, options) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    win?.setIgnoreMouseEvents(ignore, options);
-  });
-
-  ipcMain.handle('get-desktop-snapshot-and-hide', async () => {
-    try {
-      const currentDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-      console.log('Main: Current display:', currentDisplay);
-
-      const width = currentDisplay.size.width * currentDisplay.scaleFactor;
-      const height = currentDisplay.size.height * currentDisplay.scaleFactor;
-
-      let sources = [];
-      try {
-        sources = await desktopCapturer.getSources({
-          types: ['screen'],
-          thumbnailSize: { width, height },
-          fetchWindowIcons: false
-        });
-        console.log('Main: Desktop capturer sources:', sources);
-      } catch (captureError: any) {
-        console.error('Main: Failed to get sources from desktopCapturer:', captureError);
-        throw new Error(`Screen capture permission denied or failed to get sources: ${captureError.message || captureError}`);
-      }
-      
-      if (!sources || sources.length === 0) {
-        console.error('Main: No desktop capturer sources found after call.');
-        throw new Error('No screen sources found. Ensure screen recording permission is granted for this app.');
-      }
-
-      const source = sources.find(s => s.display_id.toString() === currentDisplay.id.toString());
-      console.log('Main: Selected source:', source);
-
-      if (win) {
-        win.hide();
-        console.log('Main: Window hidden.');
-      }
-      
-      if (source) {
-        console.log('Main: Returning source thumbnail DataURL.');
-        return source.thumbnail.toDataURL();
-      } else {
-        console.error(`Main: No source found matching current display ID: ${currentDisplay.id}`);
-        // Fallback: If specific display source not found, try the first available one
-        if (sources.length > 0) {
-            console.warn('Main: Falling back to first available desktop capturer source.');
-            return sources[0].thumbnail.toDataURL();
-        }
-        return null;
-      }
-    } catch (error: any) { // Explicitly type error as 'any' or 'Error'
-      console.error('Main: Error in get-desktop-snapshot-and-hide handler:', error);
-      throw new Error(`Failed to get desktop snapshot: ${error.message}`); // Re-throw to propagate to renderer
-    }
-  });
-
-  ipcMain.on('show-window-and-focus', () => {
-    if (win) {
-      win.show();
-      win.focus();
-    }
-  });
-
-  ipcMain.handle('get-screen-sources', async () => {
-    // This handler is now primarily for other tools like ScreenshotTool if it exists.
-    // For MouseEventsTool, we use 'get-desktop-snapshot-and-hide'.
-    // If this is called while a fullscreen transparent window is active, it might still return the transparent window.
-    return await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
+  ipcMain.on('update-shortcut', (event, sc) => { 
+    saveSettings({ globalShortcut: sc }); 
+    refreshShortcuts();
+    event.reply('shortcut-updated', { success: true, shortcut: sc }); 
   });
   
-  ipcMain.handle('capture-screen', async () => {
-    const currentDisplay = screen.getPrimaryDisplay();
-    const { width, height } = currentDisplay.bounds; // Capture full size including menu bar
-    
-    // 1. Hide window to avoid capturing the tool itself
-    if (win) win.hide();
+  ipcMain.on('save-settings', (_e, ns) => { 
+    saveSettings(ns); 
+    if (ns.featureShortcuts || ns.globalShortcut) refreshShortcuts();
+  });
+  ipcMain.on('get-bounding-boxes', (e) => e.reply('bounding-boxes-loaded', loadSettings().boundingBoxes || []));
+  ipcMain.on('save-bounding-boxes', (_e, b) => { const s = loadSettings(); s.boundingBoxes = b; saveSettings(s); });
+  
+  ipcMain.on('get-clipboard-history', (e) => e.reply('clipboard-history', clipboardHistory.map(i => ({...i, fullImage: undefined}))));
+  
+  // New: Request full image only when needed for preview
+  ipcMain.handle('get-clipboard-full-image', (_e, id) => clipboardHistory.find(i => i.id === id)?.fullImage || null);
 
-    // 2. Small delay to ensure window is hidden
-    await new Promise(resolve => setTimeout(resolve, 100));
+  ipcMain.on('delete-clipboard-item', (e, id) => { clipboardHistory = clipboardHistory.filter(i => i.id !== id); e.reply('clipboard-history', clipboardHistory.map(i => ({...i, fullImage: undefined}))); });
+  ipcMain.on('clear-clipboard-history', (e) => { clipboardHistory = []; e.reply('clipboard-history', []); });
+  ipcMain.on('paste-clipboard-item', (_e, t) => { 
+    clipboard.writeText(t); 
+    if (process.platform === 'darwin') app.hide(); else win?.hide(); 
+    setTimeout(() => { 
+      if (!win || win.isDestroyed() || isQuitting) return;
+      if (process.platform === 'darwin') exec('osascript -e "tell application \"System Events\" to keystroke \"v\" using command down"'); 
+      else if (process.platform === 'win32') exec('powershell -WindowStyle Hidden -Command "$wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys(\'^v\')"'); 
+      else if (process.platform === 'linux') exec('xdotool key ctrl+v'); 
+    }, 300); 
+  });
 
+
+  ipcMain.on('save-image', async (e, { dataUrl, custom }) => {
     try {
-      const sources = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: { width, height }, // request full resolution
-        fetchWindowIcons: false
-      });
-      
-      const source = sources.find(s => s.display_id.toString() === currentDisplay.id.toString()) || sources[0];
-      
-      if (!source) {
-         throw new Error('No screen source found');
-      }
+      const img = nativeImage.createFromDataURL(dataUrl);
+      let savePath = custom ? (await dialog.showSaveDialog(win!, { title: 'Save Screenshot', defaultPath: path.join(app.getPath('downloads'), `Salad-${Date.now()}.png`), filters: [{ name: 'Images', extensions: ['png'] }] })).filePath : path.join(app.getPath('downloads'), `Salad-${Date.now()}.png`);
+      if (savePath) fs.writeFile(savePath, img.toPNG(), (err) => e.reply('image-saved', { success: !err, path: savePath }));
+    } catch (err) {}
+  });
 
-      return source.thumbnail.toDataURL();
-    } catch (error) {
-      console.error('Failed to capture screen:', error);
-      throw error;
+  ipcMain.on('copy-image', (_e, { dataUrl }) => { try { clipboard.writeImage(nativeImage.createFromDataURL(dataUrl)); } catch (e) {} });
+  ipcMain.on('copy-text', (_e, text) => { try { clipboard.writeText(text); } catch (e) {} });
+  ipcMain.on('save-video', async (e, { dataUrl }) => {
+    try {
+      const { filePath, canceled } = await dialog.showSaveDialog(win!, { title: 'Save Recording', defaultPath: path.join(app.getPath('downloads'), `Salad-${Date.now()}.webm`), filters: [{ name: 'WebM Video', extensions: ['webm'] }] });
+      if (!canceled && filePath) fs.writeFile(filePath, Buffer.from(dataUrl.split(',')[1], 'base64'), (err) => e.reply('video-saved', { success: !err, path: filePath }));
+    } catch (err) {}
+  });
+
+  ipcMain.on('get-settings', (e) => e.reply('settings-loaded', loadSettings()));
+  ipcMain.on('save-active-tab', (_e, tab) => {
+    saveSettings({ activeTab: tab });
+  });
+  ipcMain.on('save-pinned-tools', (_e, ids) => {
+    saveSettings({ pinnedToolIds: ids });
+  });
+  ipcMain.handle('select-folder', async () => { const r = await dialog.showOpenDialog(win!, { properties: ['openDirectory'] }); return r.canceled ? null : r.filePaths[0]; });
+  ipcMain.on('set-ignore-mouse-events', (e, i, o) => BrowserWindow.fromWebContents(e.sender)?.setIgnoreMouseEvents(i, o));
+  ipcMain.handle('get-desktop-source-id', async () => { const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()); const s = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } }); return s.find(src => src.display_id.toString() === d.id.toString())?.id || s[0]?.id; });
+  ipcMain.handle('get-desktop-snapshot-and-hide', async () => { try { const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()); const s = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: d.size.width * d.scaleFactor, height: d.size.height * d.scaleFactor }, fetchWindowIcons: false }); const src = s.find(sr => sr.display_id.toString() === d.id.toString()) || s[0]; if (win) win.hide(); return src ? src.thumbnail.toDataURL() : null; } catch (e) { return null; } });
+  ipcMain.on('quit-app', () => {
+    isQuitting = true;
+    app.quit();
+  });
+
+  ipcMain.on('set-view-mode', (_e, mode: 'mini' | 'full') => {
+    if (win) {
+      if (mode === 'mini') {
+        const d = screen.getPrimaryDisplay().workAreaSize;
+        const width = 600;
+        const height = 80;
+        win.setSize(width, height);
+        win.setPosition(
+          Math.floor((d.width - width) / 2),
+          Math.floor(d.height * 0.75 - (height / 2))
+        );
+      } else {
+        win.setSize(1000, 700);
+        win.center();
+      }
     }
   });
 
-  // Existing IPC
-  ipcMain.on('set-fullscreen', (event, flag) => {
-    if (win) {
-      if (flag) {
-        // Use bounds of the display where the cursor is
-        const cursorPoint = screen.getCursorScreenPoint();
-        const display = screen.getDisplayNearestPoint(cursorPoint);
-        const { x, y, width, height } = display.bounds;
+  ipcMain.on('hide-window', () => win?.hide());
+  ipcMain.on('show-window-and-focus', () => { win?.show(); win?.focus(); });
+  ipcMain.handle('capture-screen', async () => {
+    // Get ALL screens
+    const displays = screen.getAllDisplays();
+    const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()); 
+    if (win) win.hide(); 
+    await new Promise(r => setTimeout(r, 150));
+    
+    const s = await desktopCapturer.getSources({ 
+      types: ['screen'], 
+      thumbnailSize: { 
+        width: d.size.width * d.scaleFactor, 
+        height: d.size.height * d.scaleFactor 
+      }, 
+      fetchWindowIcons: false 
+    });
+    
+    const src = s.find(sr => sr.display_id.toString() === d.id.toString()) || s[0]; 
+    return src ? src.thumbnail.toDataURL() : null;
+  });
+  ipcMain.on('set-fullscreen', (_e, f) => { 
+    if (win) { 
+      if (f) { 
+        // Cover ALL screens seamlessly
+        const displays = screen.getAllDisplays();
+        const minX = Math.min(...displays.map(d => d.bounds.x));
+        const minY = Math.min(...displays.map(d => d.bounds.y));
+        const maxX = Math.max(...displays.map(d => d.bounds.x + d.bounds.width));
+        const maxY = Math.max(...displays.map(d => d.bounds.y + d.bounds.height));
         
-        win.setBounds({ x, y, width, height })
-        win.setAlwaysOnTop(true, 'screen-saver') 
-        // Ensure it's visible (might have been hidden by capture)
-        win.show();
-        win.focus();
+        win.setBounds({ x: minX, y: minY, width: maxX - minX, height: maxY - minY });
+        win.setAlwaysOnTop(true, 'screen-saver'); 
+        win.show(); 
+        win.focus(); 
+      } else { 
+        win.setSize(800, 600); 
+        win.center(); 
+        win.setAlwaysOnTop(true, 'floating'); 
+      } 
+    } 
+  });
+  ipcMain.on('set-pill-mode', (_e, p) => {
+    if (win) {
+      if (p) {
+        win.setSize(200, 60);
+        const d = screen.getPrimaryDisplay().workAreaSize;
+        win.setPosition(d.width / 2 - 100, 40);
+        win.setAlwaysOnTop(true, 'screen-saver');
       } else {
-        win.setSize(800, 600)
-        win.center()
-        win.setAlwaysOnTop(true, 'floating') // Reset to normal 'always on top'
+        win.setSize(800, 600);
+        win.center();
+        win.setAlwaysOnTop(true, 'floating');
       }
     }
-  })
+  });
 })
 
-app.on('will-quit', () => {
-  globalShortcut.unregisterAll()
-  isQuitting = true
-})
+app.on('will-quit', () => { globalShortcut.unregisterAll(); isQuitting = true; })

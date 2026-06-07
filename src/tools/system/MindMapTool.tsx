@@ -193,9 +193,12 @@ function MindMapContent({ onClose }: MindMapToolProps) {
       }
       
       if (e.key === 'Backspace' || e.key === 'Delete') {
-          // Delete node and its subtree? For now just the node (reactflow handles basic delete via selection)
-          // But we want to handle it explicitly if needed. 
-          // Default Backspace works in ReactFlow if deleteKeyCode is set (default is Backspace)
+          setNodes((nds) => nds.filter((node) => !node.selected));
+          setEdges((eds) => eds.filter((edge) => {
+              const sourceNode = nodes.find(n => n.id === edge.source);
+              const targetNode = nodes.find(n => n.id === edge.target);
+              return !sourceNode?.selected && !targetNode?.selected;
+          }));
       }
 
   }, [nodes, edges, setNodes, setEdges, onLayout]);

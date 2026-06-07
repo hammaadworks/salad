@@ -11,7 +11,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "package": "npm run build && electron-builder"
+    "package": "npm run build && electron-builder",
+    "postinstall": "pnpm rebuild electron"
   },
   "build": {
     "appId": "com.hammaadworks.salad",
@@ -49,6 +50,7 @@
     "concurrently": "^9.2.1",
     "electron": "^39.2.7",
     "electron-builder": "^26.4.0",
+    "jsdom": "^29.0.1",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.3",
@@ -67,6 +69,13 @@
     "react-markdown": "^10.1.0",
     "reactflow": "^11.11.4",
     "tailwind-merge": "^3.4.0",
+    "tesseract.js": "^7.0.0",
     "zustand": "^5.0.9"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
   }
 }

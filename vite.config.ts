@@ -22,6 +22,10 @@ export default defineConfig({
       renderer: {},
     }),
   ],
+  server: {
+    port: 5050,
+    strictPort: true,
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
