@@ -146,7 +146,11 @@ npm run build         # Package for production
 ## 🚀 Roadmap
 
 - [x] **v1.0.0 Sanctuary Release:** Modular architecture and TypeShift overhaul.
-- [ ] **Salad AI:** Local note summarization and automated mind map generation.
+- [ ] **Salad AI (v1.1.0):**
+    - **Local Intelligence:** Integration of local LLMs (Ollama/WebLLM) for zero-cloud privacy.
+    - **Smart Summarization:** One-click summarization of Clipboard history and Quick Notes.
+    - **Mind Map Gen:** Transform simple text prompts or meeting notes into structured visual Mind Maps.
+    - **Semantic Search:** Deep search across all local assets (Screenshots, Notes, Clips) using vector embeddings.
 - [ ] **Mobile Companion:** Salad Mini for on-the-go productivity sync.
 - [ ] **Audio Routing:** Advanced system audio selection in the Screen Recorder.
 - [ ] **Cloud Sync:** End-to-end encrypted opt-in data synchronization.

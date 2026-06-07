@@ -3,10 +3,11 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { exec } from 'child_process'
 
-// --- Clipboard Manager (Optimized for EIO Errors) ---
+// --- Clipboard Manager (Optimized for Performance) ---
 let clipboardHistory: { id: string, text?: string, image?: string, fullImage?: string, time: number, type: 'text' | 'image' | 'video' }[] = [];
 let lastClipboardText = '';
 let lastClipboardImageHash = '';
+let cachedSettings: any = null;
 
 function startClipboardMonitor() {
   setInterval(() => {
@@ -21,40 +22,55 @@ function startClipboardMonitor() {
             const item: any = { id: Date.now().toString(), text, time: Date.now(), type: isVideo ? 'video' : 'text' };
             clipboardHistory = [item, ...clipboardHistory.filter(i => i.text !== text)].slice(0, 20);
             if (!win.webContents.isDestroyed()) {
-              win.webContents.send('clipboard-updated', clipboardHistory.map(i => ({...i, fullImage: undefined})));
+              win.webContents.send('clipboard-updated', clipboardHistory.map(i => {
+                  const { fullImage, ...rest } = i;
+                  return rest;
+              }));
             }
         }
     } catch (e) {}
 
-    // 2. Image Monitor (Resize thumbnails to prevent IPC bloat)
+    // 2. Image Monitor (Optimized: Avoid toDataURL unless size changed or new image detected)
     try {
         const image = clipboard.readImage();
         if (!image.isEmpty()) {
-            const dataUrl = image.toDataURL();
-            const hash = dataUrl.slice(-100); 
-            if (hash !== lastClipboardImageHash) {
-                lastClipboardImageHash = hash;
-                // Create a small thumbnail for the list to keep IPC fast and prevent EIO
-                const thumbnail = image.resize({ width: 200 }).toDataURL();
-                const item: any = { 
-                    id: Date.now().toString(), 
-                    image: thumbnail, 
-                    fullImage: dataUrl, // Keep full res for preview on demand
-                    time: Date.now(), 
-                    type: 'image' 
-                };
-                clipboardHistory = [item, ...clipboardHistory].slice(0, 20);
-                // Send only the thumbnails to the renderer
-                if (!win.webContents.isDestroyed()) {
-                  win.webContents.send('clipboard-updated', clipboardHistory.map(i => ({...i, fullImage: undefined})));
+            const size = image.getSize();
+            // Safeguard: Don't process massive images that might hang the system
+            if (size.width > 5000 || size.height > 5000) {
+                return;
+            }
+
+            const currentHash = `${size.width}x${size.height}`;
+            
+            if (currentHash !== lastClipboardImageHash) {
+                const dataUrl = image.toDataURL();
+                // Double check with a partial hash if size is the same but content might differ
+                const contentHash = dataUrl.slice(-100);
+                if (contentHash !== lastClipboardImageHash) {
+                    lastClipboardImageHash = contentHash;
+                    const thumbnail = image.resize({ width: 200 }).toDataURL();
+                    const item: any = { 
+                        id: Date.now().toString(), 
+                        image: thumbnail, 
+                        fullImage: dataUrl,
+                        time: Date.now(), 
+                        type: 'image' 
+                    };
+                    clipboardHistory = [item, ...clipboardHistory].slice(0, 20);
+                    if (!win.webContents.isDestroyed()) {
+                      win.webContents.send('clipboard-updated', clipboardHistory.map(i => {
+                          const { fullImage, ...rest } = i;
+                          return rest;
+                      }));
+                    }
                 }
             }
         }
     } catch (e) {}
-  }, 1500); // Increased interval slightly
+  }, 3000); 
 }
 
-// --- Settings ---
+// --- Settings (Cached to reduce Disk I/O) ---
 const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json');
 const DEFAULT_SETTINGS = {
   globalShortcut: 'CommandOrControl+Shift+G',
@@ -69,25 +85,26 @@ const DEFAULT_SETTINGS = {
 };
 
 function loadSettings() {
+  if (cachedSettings) return cachedSettings;
   try { 
     if (fs.existsSync(SETTINGS_PATH)) {
       const saved = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8'));
-      return { ...DEFAULT_SETTINGS, ...saved, featureShortcuts: { ...DEFAULT_SETTINGS.featureShortcuts, ...saved.featureShortcuts } };
+      cachedSettings = { ...DEFAULT_SETTINGS, ...saved, featureShortcuts: { ...DEFAULT_SETTINGS.featureShortcuts, ...saved.featureShortcuts } };
+      return cachedSettings;
     } 
   } catch (e) {
-    console.error('Failed to load settings', e);
   }
-  return DEFAULT_SETTINGS;
+  cachedSettings = DEFAULT_SETTINGS;
+  return cachedSettings;
 }
 
 function saveSettings(settings: any) {
   try { 
     const current = loadSettings();
-    const updated = { ...current, ...settings };
-    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(updated, null, 2)); 
-    return updated;
+    cachedSettings = { ...current, ...settings };
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(cachedSettings, null, 2)); 
+    return cachedSettings;
   } catch (e) {
-    console.error('Failed to save settings', e);
     return loadSettings();
   }
 }
@@ -96,8 +113,18 @@ let win: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 
+// Global menu reference to prevent garbage collection issues on macOS
+let contextMenu: Menu | null = null;
+let lastMenuUpdate = 0;
+
 function updateTrayMenu() {
-    if (!tray) return;
+    if (!tray || isQuitting) return;
+    
+    // Debounce menu updates to prevent macOS "WeakPtr" crashes
+    const now = Date.now();
+    if (now - lastMenuUpdate < 500) return;
+    lastMenuUpdate = now;
+
     const settings = loadSettings();
     const mainShortcut = settings.globalShortcut || 'CommandOrControl+Shift+G';
     const featureShortcuts = settings.featureShortcuts || {};
@@ -107,21 +134,24 @@ function updateTrayMenu() {
         return combo;
     };
 
-    const contextMenu = Menu.buildFromTemplate([
-        { label: 'Show Salad Launcher', accelerator: getAccelerator(mainShortcut), click: toggleWindow },
-        { type: 'separator' },
-        { label: '📸 Capture (Img/Vid)', accelerator: getAccelerator(featureShortcuts.capture), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'capture'); } },
-        { label: '📋 Clipboard History', accelerator: getAccelerator(featureShortcuts.clipboard), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'clipboard'); } },
-        { label: '📝 Quick Notes', accelerator: getAccelerator(featureShortcuts.notes), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'notes'); } },
-        { label: '⏱️ Focus Timer', accelerator: getAccelerator(featureShortcuts.focus), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'focus'); } },
-        { label: '🧠 Mind Map', accelerator: getAccelerator(featureShortcuts.mindmap), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'mindmap'); } },
-        { label: '🌬️ Breathing Tool', accelerator: getAccelerator(featureShortcuts.breathing), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'breathing'); } },
-        { type: 'separator' },
-        { label: '⚙️ Settings', click: () => { toggleWindow(); win?.webContents.send('open-settings'); } },
-        { type: 'separator' },
-        { label: 'Quit Salad', click: () => { isQuitting = true; app.quit(); } }
-    ]);
-    tray.setContextMenu(contextMenu);
+    try {
+        contextMenu = Menu.buildFromTemplate([
+            { label: 'Show Salad Launcher', accelerator: getAccelerator(mainShortcut), click: toggleWindow },
+            { type: 'separator' },
+            { label: '📸 Capture (Img/Vid)', accelerator: getAccelerator(featureShortcuts.capture), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'capture'); } },
+            { label: '📋 Clipboard History', accelerator: getAccelerator(featureShortcuts.clipboard), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'clipboard'); } },
+            { label: '📝 Quick Notes', accelerator: getAccelerator(featureShortcuts.notes), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'notes'); } },
+            { label: '⏱️ Focus Timer', accelerator: getAccelerator(featureShortcuts.focus), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'focus'); } },
+            { label: '🧠 Mind Map', accelerator: getAccelerator(featureShortcuts.mindmap), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'mindmap'); } },
+            { label: '🌬️ Breathing Tool', accelerator: getAccelerator(featureShortcuts.breathing), click: () => { toggleWindow(); win?.webContents.send('switch-tab', 'breathing'); } },
+            { type: 'separator' },
+            { label: '⚙️ Settings', click: () => { toggleWindow(); win?.webContents.send('open-settings'); } },
+            { type: 'separator' },
+            { label: 'Quit Salad', click: () => { isQuitting = true; app.quit(); } }
+        ]);
+        tray.setContextMenu(contextMenu);
+    } catch (e) {
+    }
 }
 
 function refreshShortcuts() {
@@ -135,7 +165,6 @@ function refreshShortcuts() {
             const success = globalShortcut.register(settings.globalShortcut, toggleWindow);
             if (!success) failures.push(settings.globalShortcut);
         } catch (e) {
-            console.error(`Failed to register global shortcut: ${settings.globalShortcut}`, e);
             failures.push(settings.globalShortcut);
         }
     }
@@ -155,7 +184,6 @@ function refreshShortcuts() {
                 });
                 if (!success) failures.push(combo as string);
             } catch (e) {
-                console.error(`Failed to register feature shortcut for ${feat}: ${combo}`, e);
                 failures.push(combo as string);
             }
         });
@@ -180,7 +208,10 @@ function createWindow() {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), nodeIntegration: true, contextIsolation: false },
   })
   win.center();
-  win.webContents.on('did-finish-load', () => win?.webContents.send('settings-loaded', loadSettings()));
+  win.webContents.on('did-finish-load', () => {
+      win?.webContents.send('settings-loaded', loadSettings());
+  });
+  
   if (VITE_DEV_SERVER_URL) win.loadURL(VITE_DEV_SERVER_URL); else win.loadFile(path.join(process.env.DIST || '', 'index.html'));
   win.on('close', (e) => { if (!isQuitting) { e.preventDefault(); win?.hide(); } return false; });
 }
@@ -228,8 +259,7 @@ app.whenReady().then(() => {
   });
 
   win?.on('blur', () => {
-    const { width } = win?.getBounds() || { width: 0 };
-    if (width < screen.getPrimaryDisplay().workAreaSize.width) win?.hide();
+    // Aggressive blur hide disabled for stability. User can hide via shortcut or clicking home.
   });
 
   refreshShortcuts();
@@ -238,15 +268,20 @@ app.whenReady().then(() => {
 
   // Tray implementation with robust path resolution
   const trayIconPath = path.join(process.env.VITE_PUBLIC || '', 'tray.png');
+  const iconPath = path.join(process.env.VITE_PUBLIC || '', 'icon.png');
+  
   let trayIcon = nativeImage.createFromPath(trayIconPath);
   
   if (trayIcon.isEmpty()) {
-    // Fallback to a simple circle if icon is missing
+    trayIcon = nativeImage.createFromPath(iconPath);
+  }
+
+  if (trayIcon.isEmpty()) {
     trayIcon = nativeImage.createFromNamedImage('NSStatusAvailable', [0, 0, 0]);
   }
 
   if (process.platform === 'darwin') {
-    trayIcon = trayIcon.resize({ width: 20, height: 20 });
+    trayIcon = trayIcon.resize({ width: 22, height: 22 });
     trayIcon.setTemplateImage(true);
   } else {
     trayIcon = trayIcon.resize({ width: 16, height: 16 });
@@ -271,12 +306,20 @@ app.whenReady().then(() => {
   ipcMain.on('get-bounding-boxes', (e) => e.reply('bounding-boxes-loaded', loadSettings().boundingBoxes || []));
   ipcMain.on('save-bounding-boxes', (_e, b) => { const s = loadSettings(); s.boundingBoxes = b; saveSettings(s); });
   
-  ipcMain.on('get-clipboard-history', (e) => e.reply('clipboard-history', clipboardHistory.map(i => ({...i, fullImage: undefined}))));
+  ipcMain.on('get-clipboard-history', (e) => e.reply('clipboard-history', clipboardHistory.map(i => {
+      const { fullImage, ...rest } = i;
+      return rest;
+  })));
   
-  // New: Request full image only when needed for preview
   ipcMain.handle('get-clipboard-full-image', (_e, id) => clipboardHistory.find(i => i.id === id)?.fullImage || null);
 
-  ipcMain.on('delete-clipboard-item', (e, id) => { clipboardHistory = clipboardHistory.filter(i => i.id !== id); e.reply('clipboard-history', clipboardHistory.map(i => ({...i, fullImage: undefined}))); });
+  ipcMain.on('delete-clipboard-item', (e, id) => { 
+      clipboardHistory = clipboardHistory.filter(i => i.id !== id); 
+      e.reply('clipboard-history', clipboardHistory.map(i => {
+          const { fullImage, ...rest } = i;
+          return rest;
+      })); 
+  });
   ipcMain.on('clear-clipboard-history', (e) => { clipboardHistory = []; e.reply('clipboard-history', []); });
   ipcMain.on('paste-clipboard-item', (_e, t) => { 
     clipboard.writeText(t); 
@@ -315,7 +358,12 @@ app.whenReady().then(() => {
     saveSettings({ pinnedToolIds: ids });
   });
   ipcMain.handle('select-folder', async () => { const r = await dialog.showOpenDialog(win!, { properties: ['openDirectory'] }); return r.canceled ? null : r.filePaths[0]; });
-  ipcMain.on('set-ignore-mouse-events', (e, i, o) => BrowserWindow.fromWebContents(e.sender)?.setIgnoreMouseEvents(i, o));
+  ipcMain.on('set-ignore-mouse-events', (e, i, o) => {
+      const browserWin = BrowserWindow.fromWebContents(e.sender);
+      if (browserWin && !browserWin.isDestroyed()) {
+          browserWin.setIgnoreMouseEvents(i, o);
+      }
+  });
   ipcMain.handle('get-desktop-source-id', async () => { const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()); const s = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } }); return s.find(src => src.display_id.toString() === d.id.toString())?.id || s[0]?.id; });
   ipcMain.handle('get-desktop-snapshot-and-hide', async () => { try { const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()); const s = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: d.size.width * d.scaleFactor, height: d.size.height * d.scaleFactor }, fetchWindowIcons: false }); const src = s.find(sr => sr.display_id.toString() === d.id.toString()) || s[0]; if (win) win.hide(); return src ? src.thumbnail.toDataURL() : null; } catch (e) { return null; } });
   ipcMain.on('quit-app', () => {
@@ -324,7 +372,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.on('set-view-mode', (_e, mode: 'mini' | 'full') => {
-    if (win) {
+    if (win && !win.isDestroyed()) {
       if (mode === 'mini') {
         const d = screen.getPrimaryDisplay().workAreaSize;
         const width = 600;
@@ -341,13 +389,11 @@ app.whenReady().then(() => {
     }
   });
 
-  ipcMain.on('hide-window', () => win?.hide());
-  ipcMain.on('show-window-and-focus', () => { win?.show(); win?.focus(); });
+  ipcMain.on('hide-window', () => { if (win && !win.isDestroyed()) win.hide(); });
+  ipcMain.on('show-window-and-focus', () => { if (win && !win.isDestroyed()) { win.show(); win.focus(); } });
   ipcMain.handle('capture-screen', async () => {
-    // Get ALL screens
-    const displays = screen.getAllDisplays();
     const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()); 
-    if (win) win.hide(); 
+    if (win && !win.isDestroyed()) win.hide(); 
     await new Promise(r => setTimeout(r, 150));
     
     const s = await desktopCapturer.getSources({ 
@@ -363,9 +409,8 @@ app.whenReady().then(() => {
     return src ? src.thumbnail.toDataURL() : null;
   });
   ipcMain.on('set-fullscreen', (_e, f) => { 
-    if (win) { 
+    if (win && !win.isDestroyed()) { 
       if (f) { 
-        // Cover ALL screens seamlessly
         const displays = screen.getAllDisplays();
         const minX = Math.min(...displays.map(d => d.bounds.x));
         const minY = Math.min(...displays.map(d => d.bounds.y));
@@ -384,7 +429,7 @@ app.whenReady().then(() => {
     } 
   });
   ipcMain.on('set-pill-mode', (_e, p) => {
-    if (win) {
+    if (win && !win.isDestroyed()) {
       if (p) {
         win.setSize(200, 60);
         const d = screen.getPrimaryDisplay().workAreaSize;

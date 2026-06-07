@@ -76,8 +76,12 @@ export default function CaptureTool({ onClose }: CaptureToolProps) {
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const videoPreviewRef = useRef<HTMLVideoElement>(null)
 
+  const initializedRef = useRef(false)
+
   // Initialization
   const captureInitialScreen = useCallback(async () => {
+    if (initializedRef.current) return;
+    initializedRef.current = true;
     try {
       const url = await ipcRenderer.invoke('capture-screen')
       setScreenshotUrl(url)

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useCallback } from 'react'
 import { Settings as SettingsIcon, Power, X, Pin, PinOff, Package, LayoutGrid } from 'lucide-react'
 import { ipcRenderer } from 'electron'
 import { ToolRegistry } from './registry'
@@ -53,29 +53,12 @@ function App() {
 
   const ActiveTool = ToolRegistry.find(t => t.id === activeTab)
 
-  const handleQuit = () => ipcRenderer.send('quit-app')
+  const handleCloseTool = useCallback(() => {
+    setActiveTab('home');
+    setViewMode('mini');
+  }, [setActiveTab, setViewMode]);
 
-  // Keyboard Shortcuts (1-9)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const num = parseInt(e.key)
-      if (num >= 1 && num <= 9) {
-        if (num === 5) {
-          setViewMode('full')
-          setActiveTab('home')
-        } else {
-          const idx = num < 5 ? num - 1 : num - 2
-          const toolId = pinnedToolIds[idx]
-          if (toolId) {
-            setActiveTab(toolId)
-            setViewMode('mini')
-          }
-        }
-      }
-    }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [pinnedToolIds, setActiveTab, setViewMode])
+  const handleQuit = useCallback(() => ipcRenderer.send('quit-app'), []);
 
   return (
     <div className={cn(
@@ -251,7 +234,7 @@ function App() {
             <header className="h-14 flex items-center justify-between px-8 shrink-0 border-b border-white/5 bg-zinc-950/50 backdrop-blur-md">
               <h2 className="text-sm font-semibold text-zinc-100">{ActiveTool.label}</h2>
               <button 
-                onClick={() => { setActiveTab('home'); setViewMode('mini'); }}
+                onClick={handleCloseTool}
                 className="flex items-center gap-2 text-zinc-500 hover:text-white transition-colors"
               >
                 <span className="text-[10px] font-bold uppercase tracking-widest">Back to Strip</span>
@@ -263,7 +246,7 @@ function App() {
                 "h-full w-full animate-fade-in",
                 ActiveTool.fullscreen ? "fixed inset-0 z-[100] bg-zinc-950" : "p-8"
               )}>
-                <ActiveTool.component onClose={() => { setActiveTab('home'); setViewMode('mini'); }} />
+                <ActiveTool.component onClose={handleCloseTool} />
               </div>
             </div>
           </div>
